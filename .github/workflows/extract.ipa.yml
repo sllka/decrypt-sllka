@@ -1,0 +1,99 @@
+name: Extract and Analyze IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: 'Прямая ссылка на .ipa файл (или оставьте пустым, если загружаете в репозиторий)'
+        required: false
+        type: string
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Prepare environment
+        run: |
+          mkdir -p analysis/strings analysis/app analysis/resources
+          
+      - name: Find or download IPA
+        run: |
+          # Ищем .ipa файл в корне репозитория или качаем по ссылке
+          IPA_FILE=$(find . -maxdepth 1 -name "*.ipa" | head -n 1)
+          
+          if [ -n "$inputs.ipa_url" ]; then
+            echo "Скачивание IPA по ссылке..."
+            curl -L -o app.ipa "${{ inputs.ipa_url }}"
+          elif [ -n "$IPA_FILE" ]; then
+            echo "Найден локальный IPA: $IPA_FILE"
+            cp "$IPA_FILE" app.ipa
+          else
+            echo "Ошибка: .ipa файл не найден в репозитории и не указана ссылка!"
+            exit 1
+          fi
+
+      - name: Unpack IPA
+        run: |
+          mkdir -p extracted
+          unzip -q app.ipa -d extracted/
+          
+          # Находим путь к .app папке
+          APP_PATH=$(find extracted/Payload -name "*.app" | head -n 1)
+          echo "APP_PATH=$APP_PATH" >> $GITHUB_ENV
+          echo "Распаковано в: $APP_PATH"
+
+      - name: Extract Info.plist and structure
+        run: |
+          APP_PATH=$(find extracted/Payload -name "*.app" | head -n 1)
+          
+          # Сохраняем список всех файлов
+          find "$APP_PATH" -type f > analysis/app/all_files.txt
+          echo "$APP_PATH" > analysis/app/app_path.txt
+          
+          # Конвертируем Info.plist в читаемый текст (если он в бинарном формате)
+          PLIST_FILE="$APP_PATH/Info.plist"
+          if [ -f "$PLIST_FILE" ]; then
+            python3 -c "
+import plistlib, sys
+try:
+    with open('$PLIST_FILE', 'rb') as f:
+        data = plistlib.load(f)
+    with open('analysis/resources/Info_readable.txt', 'w') as out:
+        out.write(str(data))
+    print('Info.plist успешно расшифрован.')
+except Exception as e:
+    print('Ошибка чтения plist:', e)
+"
+          fi
+
+      - name: Extract Strings from Binary
+        run: |
+          APP_PATH=$(find extracted/Payload -name "*.app" | head -n 1)
+          APP_NAME=$(basename "$APP_PATH" .app)
+          BINARY="$APP_PATH/$APP_NAME"
+          
+          if [ -f "$BINARY" ]; then
+            echo "Извлечение строк из бинарника..."
+            # Вытаскиваем читаемые строки длиннее 4 символов
+            strings "$BINARY" > analysis/strings/Droze_all.txt
+            
+            # Фильтруем полезное (ссылки, урлы)
+            grep -iE "https?://|http?://" analysis/strings/Droze_all.txt > analysis/strings/Droze_urls.txt || true
+          else
+            echo "Главный бинарник не найден!"
+          fi
+
+      - name: Upload Analysis Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-analysis-report
+          path: analysis/
