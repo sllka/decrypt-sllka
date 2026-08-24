@@ -1,0 +1,246 @@
+name: Analyze IPA / Mach-O
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p analysis
+          mkdir -p extracted
+          mkdir -p analysis/disasm
+          mkdir -p analysis/strings
+          mkdir -p analysis/symbols
+          mkdir -p analysis/headers
+          mkdir -p analysis/objc
+
+          if [ ! -f "Droze.ipa" ]; then
+            echo "ERROR: Droze.ipa not found"
+            exit 1
+          fi
+
+      - name: Extract IPA
+        shell: bash
+        run: |
+          set -e
+
+          unzip -q "app.ipa" -d extracted
+
+          echo "=== IPA structure ===" > analysis/structure.txt
+          find extracted -maxdepth 6 -type f | sort >> analysis/structure.txt
+
+      - name: Find Mach-O files
+        shell: bash
+        run: |
+          set -e
+
+          : > analysis/macho_files.txt
+
+          while IFS= read -r -d '' file; do
+            type="$(file -b "$file")"
+
+            if echo "$type" | grep -q "Mach-O"; then
+              echo "$file" >> analysis/macho_files.txt
+            fi
+          done < <(find extracted -type f -print0)
+
+          echo "Found Mach-O files:"
+          cat analysis/macho_files.txt || true
+
+      - name: Analyze Mach-O
+        shell: bash
+        run: |
+          set -e
+
+          while IFS= read -r binary; do
+
+            [ -z "$binary" ] && continue
+
+            name="$(basename "$binary")"
+            safe="$(echo "$name" | tr '/ ' '__')"
+
+            echo "========================================"
+            echo "$binary"
+            echo "========================================"
+
+            {
+              echo "FILE: $binary"
+              echo
+              echo "=== file ==="
+              file "$binary"
+
+              echo
+              echo "=== architectures ==="
+              lipo -info "$binary" 2>&1 || true
+
+              echo
+              echo "=== otool -hv ==="
+              otool -hv "$binary" 2>&1 || true
+
+              echo
+              echo "=== otool -l ==="
+              otool -l "$binary" 2>&1 || true
+
+              echo
+              echo "=== linked libraries ==="
+              otool -L "$binary" 2>&1 || true
+
+              echo
+              echo "=== rpaths ==="
+              otool -l "$binary" 2>&1 | grep -A3 -E "LC_RPATH|path " || true
+
+              echo
+              echo "=== load commands ==="
+              otool -l "$binary" 2>&1 | grep -E "LC_|cmdsize|name |path " || true
+
+            } > "analysis/headers/${safe}.txt"
+
+            nm -arch arm64 -m "$binary" > \
+              "analysis/symbols/${safe}_nm.txt" 2>&1 || \
+            nm -m "$binary" > \
+              "analysis/symbols/${safe}_nm.txt" 2>&1 || true
+
+            nm -arch arm64 -gU "$binary" > \
+              "analysis/symbols/${safe}_exports.txt" 2>&1 || \
+            nm -gU "$binary" > \
+              "analysis/symbols/${safe}_exports.txt" 2>&1 || true
+
+            strings -a - "$binary" > \
+              "analysis/strings/${safe}_strings.txt" 2>/dev/null || true
+
+          done < analysis/macho_files.txt
+
+      - name: Extract Objective-C metadata
+        shell: bash
+        run: |
+          set -e
+
+          while IFS= read -r binary; do
+
+            [ -z "$binary" ] && continue
+
+            name="$(basename "$binary")"
+            safe="$(echo "$name" | tr '/ ' '__')"
+
+            {
+              echo "FILE: $binary"
+              echo
+
+              echo "=== Objective-C related symbols ==="
+              nm -arch arm64 "$binary" 2>/dev/null |
+                grep -E 'OBJC|objc_|_OBJC_|_NS' || true
+
+              echo
+              echo "=== Objective-C strings ==="
+              strings -a "$binary" 2>/dev/null |
+                grep -E '^[+-]?\[[A-Za-z_][A-Za-z0-9_]* |^[A-Za-z_][A-Za-z0-9_]*$' |
+                head -10000 || true
+
+              echo
+              echo "=== Class / selector hints ==="
+              strings -a "$binary" 2>/dev/null |
+                grep -Ei 'class|selector|method|objc|swift|viewcontroller|manager|controller|delegate' |
+                head -10000 || true
+
+            } > "analysis/objc/${safe}_objc.txt"
+
+          done < analysis/macho_files.txt
+
+      - name: Disassemble Mach-O
+        shell: bash
+        run: |
+          set -e
+
+          LLVM_OBJDUMP="$(xcrun --find llvm-objdump)"
+
+          echo "Using: $LLVM_OBJDUMP"
+
+          while IFS= read -r binary; do
+
+            [ -z "$binary" ] && continue
+
+            name="$(basename "$binary")"
+            safe="$(echo "$name" | tr '/ ' '__')"
+
+            echo "Disassembling $binary"
+
+            "$LLVM_OBJDUMP" \
+              --macho \
+              --arch=arm64 \
+              --disassemble \
+              --no-show-raw-insn \
+              "$binary" \
+              > "analysis/disasm/${safe}_arm64.asm" 2>&1 || true
+
+            "$LLVM_OBJDUMP" \
+              --macho \
+              --arch=arm64 \
+              --section=__TEXT,__text \
+              "$binary" \
+              > "analysis/disasm/${safe}_text.asm" 2>&1 || true
+
+          done < analysis/macho_files.txt
+
+      - name: Generate summary
+        shell: bash
+        run: |
+          set -e
+
+          {
+            echo "# Mach-O Analysis"
+            echo
+            echo "Generated: $(date)"
+            echo
+
+            echo "## Mach-O files"
+            if [ -s analysis/macho_files.txt ]; then
+              while IFS= read -r file; do
+                echo "- $file"
+              done < analysis/macho_files.txt
+            else
+              echo "No Mach-O files found."
+            fi
+
+            echo
+            echo "## File count"
+            find extracted -type f | wc -l
+
+            echo
+            echo "## dylib files"
+            find extracted -type f \
+              \( -name "*.dylib" -o -name "*.tbd" \) \
+              -print || true
+
+            echo
+            echo "## Frameworks"
+            find extracted -type d -name "*.framework" -print || true
+
+          } > analysis/SUMMARY.md
+
+      - name: Pack results
+        shell: bash
+        run: |
+          set -e
+
+          zip -qr analysis.zip analysis
+
+          echo "=== Result ==="
+          ls -lh analysis.zip
+
+      - name: Upload analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-analysis
+          path: analysis.zip
+          if-no-files-found: error
+          retention-days: 7
