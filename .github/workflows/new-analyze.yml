@@ -1,45 +1,114 @@
-name: Analyze IPA / Mach-O
+name: Analyze Droze IPA
 
 on:
   workflow_dispatch:
 
 jobs:
   analyze:
+    name: Analyze Droze.ipa
     runs-on: macos-14
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare
+      - name: Prepare workspace
         shell: bash
         run: |
           set -e
 
           mkdir -p analysis
-          mkdir -p extracted
-          mkdir -p analysis/disasm
-          mkdir -p analysis/strings
-          mkdir -p analysis/symbols
           mkdir -p analysis/headers
+          mkdir -p analysis/symbols
+          mkdir -p analysis/strings
           mkdir -p analysis/objc
+          mkdir -p analysis/disasm
+          mkdir -p analysis/dylibs
+          mkdir -p analysis/frameworks
+          mkdir -p extracted
 
           if [ ! -f "Droze.ipa" ]; then
-            echo "ERROR: Droze.ipa not found"
+            echo "ERROR: Droze.ipa was not found in repository root."
+            echo
+            echo "Files in repository:"
+            ls -la
             exit 1
           fi
 
-      - name: Extract IPA
+          echo "Found Droze.ipa:"
+          ls -lh "Droze.ipa"
+
+      - name: Extract Droze.ipa
         shell: bash
         run: |
           set -e
 
-          unzip -q "app.ipa" -d extracted
+          echo "Extracting Droze.ipa..."
 
-          echo "=== IPA structure ===" > analysis/structure.txt
-          find extracted -maxdepth 6 -type f | sort >> analysis/structure.txt
+          unzip -q "Droze.ipa" -d extracted
 
-      - name: Find Mach-O files
+          echo "Extraction complete."
+
+          echo "=== IPA structure ===" \
+            > analysis/structure.txt
+
+          find extracted -print \
+            | sort \
+            >> analysis/structure.txt
+
+      - name: Find application bundle
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== Application bundles ===" \
+            > analysis/app_bundles.txt
+
+          find extracted/Payload \
+            -maxdepth 2 \
+            -type d \
+            -name "*.app" \
+            -print \
+            >> analysis/app_bundles.txt \
+            2>/dev/null || true
+
+          cat analysis/app_bundles.txt || true
+
+      - name: Find dylibs and frameworks
+        shell: bash
+        run: |
+          set -e
+
+          echo "=== DYLIB FILES ===" \
+            > analysis/dylibs.txt
+
+          find extracted \
+            -type f \
+            -name "*.dylib" \
+            -print \
+            | sort \
+            >> analysis/dylibs.txt \
+            2>/dev/null || true
+
+          echo "=== FRAMEWORK DIRECTORIES ===" \
+            > analysis/frameworks.txt
+
+          find extracted \
+            -type d \
+            -name "*.framework" \
+            -print \
+            | sort \
+            >> analysis/frameworks.txt \
+            2>/dev/null || true
+
+          echo "=== DYLIBS ==="
+          cat analysis/dylibs.txt || true
+
+          echo
+          echo "=== FRAMEWORKS ==="
+          cat analysis/frameworks.txt || true
+
+      - name: Find all Mach-O binaries
         shell: bash
         run: |
           set -e
@@ -47,17 +116,31 @@ jobs:
           : > analysis/macho_files.txt
 
           while IFS= read -r -d '' file; do
-            type="$(file -b "$file")"
+
+            type="$(file -b "$file" 2>/dev/null || true)"
 
             if echo "$type" | grep -q "Mach-O"; then
               echo "$file" >> analysis/macho_files.txt
             fi
-          done < <(find extracted -type f -print0)
 
-          echo "Found Mach-O files:"
-          cat analysis/macho_files.txt || true
+          done < <(
+            find extracted \
+              -type f \
+              -print0
+          )
 
-      - name: Analyze Mach-O
+          sort -u analysis/macho_files.txt \
+            -o analysis/macho_files.txt
+
+          echo "=== Mach-O files found ==="
+
+          if [ -s analysis/macho_files.txt ]; then
+            cat analysis/macho_files.txt
+          else
+            echo "No Mach-O files found."
+          fi
+
+      - name: Analyze Mach-O headers
         shell: bash
         run: |
           set -e
@@ -67,56 +150,158 @@ jobs:
             [ -z "$binary" ] && continue
 
             name="$(basename "$binary")"
-            safe="$(echo "$name" | tr '/ ' '__')"
 
-            echo "========================================"
-            echo "$binary"
-            echo "========================================"
+            safe="$(
+              echo "$name" \
+                | tr '/ ' '__' \
+                | tr -cd '[:alnum:]_.-'
+            )"
+
+            output="analysis/headers/${safe}_headers.txt"
 
             {
-              echo "FILE: $binary"
+              echo "============================================================"
+              echo "FILE"
+              echo "============================================================"
+              echo "$binary"
               echo
-              echo "=== file ==="
-              file "$binary"
 
+              echo "============================================================"
+              echo "file"
+              echo "============================================================"
+              file "$binary" || true
               echo
-              echo "=== architectures ==="
+
+              echo "============================================================"
+              echo "lipo -info"
+              echo "============================================================"
               lipo -info "$binary" 2>&1 || true
-
               echo
-              echo "=== otool -hv ==="
+
+              echo "============================================================"
+              echo "otool -hv"
+              echo "============================================================"
               otool -hv "$binary" 2>&1 || true
-
               echo
-              echo "=== otool -l ==="
+
+              echo "============================================================"
+              echo "otool -L"
+              echo "Linked libraries:"
+              echo "============================================================"
+              otool -L "$binary" 2>&1 || true
+              echo
+
+              echo "============================================================"
+              echo "LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB"
+              echo "============================================================"
+              otool -l "$binary" 2>&1 \
+                | grep -A5 -E \
+                "LC_LOAD_DYLIB|LC_LOAD_WEAK_DYLIB|LC_REEXPORT_DYLIB" \
+                || true
+              echo
+
+              echo "============================================================"
+              echo "LC_RPATH"
+              echo "============================================================"
+              otool -l "$binary" 2>&1 \
+                | grep -A3 "LC_RPATH" \
+                || true
+              echo
+
+              echo "============================================================"
+              echo "LC_ID_DYLIB"
+              echo "============================================================"
+              otool -l "$binary" 2>&1 \
+                | grep -A4 "LC_ID_DYLIB" \
+                || true
+              echo
+
+              echo "============================================================"
+              echo "Load commands"
+              echo "============================================================"
               otool -l "$binary" 2>&1 || true
 
-              echo
-              echo "=== linked libraries ==="
-              otool -L "$binary" 2>&1 || true
+            } > "$output"
 
-              echo
-              echo "=== rpaths ==="
-              otool -l "$binary" 2>&1 | grep -A3 -E "LC_RPATH|path " || true
+            echo "Analyzed: $binary"
 
-              echo
-              echo "=== load commands ==="
-              otool -l "$binary" 2>&1 | grep -E "LC_|cmdsize|name |path " || true
+          done < analysis/macho_files.txt
 
-            } > "analysis/headers/${safe}.txt"
+      - name: Extract symbols
+        shell: bash
+        run: |
+          set -e
 
-            nm -arch arm64 -m "$binary" > \
-              "analysis/symbols/${safe}_nm.txt" 2>&1 || \
-            nm -m "$binary" > \
-              "analysis/symbols/${safe}_nm.txt" 2>&1 || true
+          while IFS= read -r binary; do
 
-            nm -arch arm64 -gU "$binary" > \
-              "analysis/symbols/${safe}_exports.txt" 2>&1 || \
-            nm -gU "$binary" > \
-              "analysis/symbols/${safe}_exports.txt" 2>&1 || true
+            [ -z "$binary" ] && continue
 
-            strings -a - "$binary" > \
-              "analysis/strings/${safe}_strings.txt" 2>/dev/null || true
+            name="$(basename "$binary")"
+
+            safe="$(
+              echo "$name" \
+                | tr '/ ' '__' \
+                | tr -cd '[:alnum:]_.-'
+            )"
+
+            echo "=== nm ===" \
+              > "analysis/symbols/${safe}_nm.txt"
+
+            nm -arch arm64 -m "$binary" \
+              >> "analysis/symbols/${safe}_nm.txt" \
+              2>&1 || \
+            nm -m "$binary" \
+              >> "analysis/symbols/${safe}_nm.txt" \
+              2>&1 || true
+
+            echo "=== EXPORTS ===" \
+              > "analysis/symbols/${safe}_exports.txt"
+
+            nm -arch arm64 -gU "$binary" \
+              >> "analysis/symbols/${safe}_exports.txt" \
+              2>&1 || \
+            nm -gU "$binary" \
+              >> "analysis/symbols/${safe}_exports.txt" \
+              2>&1 || true
+
+            echo "=== UNDEFINED ===" \
+              > "analysis/symbols/${safe}_undefined.txt"
+
+            nm -arch arm64 -u "$binary" \
+              >> "analysis/symbols/${safe}_undefined.txt" \
+              2>&1 || \
+            nm -u "$binary" \
+              >> "analysis/symbols/${safe}_undefined.txt" \
+              2>&1 || true
+
+          done < analysis/macho_files.txt
+
+      - name: Extract strings
+        shell: bash
+        run: |
+          set -e
+
+          while IFS= read -r binary; do
+
+            [ -z "$binary" ] && continue
+
+            name="$(basename "$binary")"
+
+            safe="$(
+              echo "$name" \
+                | tr '/ ' '__' \
+                | tr -cd '[:alnum:]_.-'
+            )"
+
+            strings -a "$binary" \
+              > "analysis/strings/${safe}_strings.txt" \
+              2>/dev/null || true
+
+            strings -a "$binary" 2>/dev/null \
+              | grep -Ei \
+              "objc|swift|class|selector|method|manager|controller|view|render|shader|material|player|network|inject|hook|dylib|framework" \
+              > "analysis/strings/${safe}_interesting.txt" \
+              || true
 
           done < analysis/macho_files.txt
 
@@ -130,49 +315,81 @@ jobs:
             [ -z "$binary" ] && continue
 
             name="$(basename "$binary")"
-            safe="$(echo "$name" | tr '/ ' '__')"
+
+            safe="$(
+              echo "$name" \
+                | tr '/ ' '__' \
+                | tr -cd '[:alnum:]_.-'
+            )"
+
+            output="analysis/objc/${safe}_objc.txt"
 
             {
+              echo "============================================================"
+              echo "OBJECTIVE-C / SWIFT METADATA"
+              echo "============================================================"
               echo "FILE: $binary"
               echo
 
-              echo "=== Objective-C related symbols ==="
-              nm -arch arm64 "$binary" 2>/dev/null |
-                grep -E 'OBJC|objc_|_OBJC_|_NS' || true
+              echo "============================================================"
+              echo "Objective-C symbols"
+              echo "============================================================"
+
+              nm -arch arm64 "$binary" 2>/dev/null \
+                | grep -E \
+                "OBJC|objc_|_OBJC_|_OBJC_CLASS_|_OBJC_METACLASS_" \
+                || true
 
               echo
-              echo "=== Objective-C strings ==="
-              strings -a "$binary" 2>/dev/null |
-                grep -E '^[+-]?\[[A-Za-z_][A-Za-z0-9_]* |^[A-Za-z_][A-Za-z0-9_]*$' |
-                head -10000 || true
+
+              echo "============================================================"
+              echo "Objective-C related strings"
+              echo "============================================================"
+
+              strings -a "$binary" 2>/dev/null \
+                | grep -Ei \
+                "objc|selector|class|method|viewcontroller|controller|manager|delegate" \
+                | head -20000 \
+                || true
 
               echo
-              echo "=== Class / selector hints ==="
-              strings -a "$binary" 2>/dev/null |
-                grep -Ei 'class|selector|method|objc|swift|viewcontroller|manager|controller|delegate' |
-                head -10000 || true
 
-            } > "analysis/objc/${safe}_objc.txt"
+              echo "============================================================"
+              echo "Swift related strings"
+              echo "============================================================"
+
+              strings -a "$binary" 2>/dev/null \
+                | grep -Ei \
+                "_T[0-9]|swift|SwiftUI" \
+                | head -20000 \
+                || true
+
+            } > "$output"
 
           done < analysis/macho_files.txt
 
-      - name: Disassemble Mach-O
+      - name: Disassemble ARM64
         shell: bash
         run: |
           set -e
 
           LLVM_OBJDUMP="$(xcrun --find llvm-objdump)"
 
-          echo "Using: $LLVM_OBJDUMP"
+          echo "llvm-objdump: $LLVM_OBJDUMP"
 
           while IFS= read -r binary; do
 
             [ -z "$binary" ] && continue
 
             name="$(basename "$binary")"
-            safe="$(echo "$name" | tr '/ ' '__')"
 
-            echo "Disassembling $binary"
+            safe="$(
+              echo "$name" \
+                | tr '/ ' '__' \
+                | tr -cd '[:alnum:]_.-'
+            )"
+
+            echo "Disassembling: $binary"
 
             "$LLVM_OBJDUMP" \
               --macho \
@@ -180,67 +397,92 @@ jobs:
               --disassemble \
               --no-show-raw-insn \
               "$binary" \
-              > "analysis/disasm/${safe}_arm64.asm" 2>&1 || true
+              > "analysis/disasm/${safe}_arm64.asm" \
+              2>&1 || true
 
             "$LLVM_OBJDUMP" \
               --macho \
               --arch=arm64 \
               --section=__TEXT,__text \
               "$binary" \
-              > "analysis/disasm/${safe}_text.asm" 2>&1 || true
+              > "analysis/disasm/${safe}__TEXT__text.asm" \
+              2>&1 || true
 
           done < analysis/macho_files.txt
 
-      - name: Generate summary
+      - name: Generate important findings
         shell: bash
         run: |
           set -e
 
           {
-            echo "# Mach-O Analysis"
+            echo "# Droze IPA Analysis"
             echo
             echo "Generated: $(date)"
             echo
 
             echo "## Mach-O files"
             if [ -s analysis/macho_files.txt ]; then
-              while IFS= read -r file; do
-                echo "- $file"
-              done < analysis/macho_files.txt
+              cat analysis/macho_files.txt
             else
               echo "No Mach-O files found."
             fi
 
             echo
-            echo "## File count"
-            find extracted -type f | wc -l
-
-            echo
             echo "## dylib files"
-            find extracted -type f \
-              \( -name "*.dylib" -o -name "*.tbd" \) \
-              -print || true
+            cat analysis/dylibs.txt || true
 
             echo
-            echo "## Frameworks"
-            find extracted -type d -name "*.framework" -print || true
+            echo "## frameworks"
+            cat analysis/frameworks.txt || true
 
-          } > analysis/SUMMARY.md
+            echo
+            echo "## Linked dylibs"
+            grep -R \
+              -E \
+              "LC_LOAD_DYLIB|LC_LOAD_WEAK_DYLIB|LC_REEXPORT_DYLIB|@rpath|@loader_path|@executable_path" \
+              analysis/headers \
+              2>/dev/null \
+              || true
 
-      - name: Pack results
+            echo
+            echo "## Interesting symbols"
+            grep -R \
+              -Ei \
+              "hook|inject|objc|swift|manager|controller|render|player|network|patch|method|selector" \
+              analysis/symbols \
+              2>/dev/null \
+              | head -10000 \
+              || true
+
+            echo
+            echo "## Interesting strings"
+            grep -R \
+              -Ei \
+              "hook|inject|objc|swift|dylib|framework|manager|controller|render|player|network|patch" \
+              analysis/strings \
+              2>/dev/null \
+              | head -10000 \
+              || true
+
+          } > analysis/IMPORTANT_FINDINGS.txt
+
+      - name: Create analysis archive
         shell: bash
         run: |
           set -e
 
-          zip -qr analysis.zip analysis
+          zip -qr \
+            Droze-analysis.zip \
+            analysis
 
-          echo "=== Result ==="
-          ls -lh analysis.zip
+          echo "Analysis archive:"
+          ls -lh Droze-analysis.zip
 
-      - name: Upload analysis
+      - name: Upload analysis artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ipa-analysis
-          path: analysis.zip
+          name: Droze-analysis
+          path: Droze-analysis.zip
           if-no-files-found: error
           retention-days: 7
