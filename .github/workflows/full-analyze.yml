@@ -1,136 +1,140 @@
-name: Full Droze IPA Analysis
+name: Droze IPA - Deep Static Analysis
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   analyze:
     runs-on: macos-14
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Prepare
+      - name: Prepare workspace
         shell: bash
         run: |
           set -e
 
-          test -f Droze.ipa || {
-            echo "ERROR: Droze.ipa not found in repository root"
+          if [ ! -f "Droze.ipa" ]; then
+            echo "::error::Droze.ipa was not found in repository root"
             exit 1
-          }
+          fi
 
-          rm -rf extracted analysis
-          mkdir -p extracted analysis
+          rm -rf extracted analysis Droze-analysis.zip
 
-          mkdir -p analysis/macho
-          mkdir -p analysis/headers
-          mkdir -p analysis/symbols
-          mkdir -p analysis/strings
-          mkdir -p analysis/objc
-          mkdir -p analysis/disasm
-          mkdir -p analysis/signing
-          mkdir -p analysis/resources
-          mkdir -p analysis/search
-          mkdir -p analysis/hashes
+          mkdir -p \
+            extracted \
+            analysis/app \
+            analysis/macho \
+            analysis/headers \
+            analysis/symbols \
+            analysis/objc \
+            analysis/swift \
+            analysis/strings \
+            analysis/disasm \
+            analysis/search \
+            analysis/resources \
+            analysis/signing \
+            analysis/hashes \
+            analysis/report
 
       - name: Extract IPA
         shell: bash
         run: |
           set -e
-          unzip -q Droze.ipa -d extracted
+
+          unzip -q "Droze.ipa" -d extracted
 
           find extracted -type f -print | sort \
-            > analysis/files.txt
+            > analysis/app/all_files.txt
 
           find extracted -type d -print | sort \
-            > analysis/directories.txt
+            > analysis/app/all_directories.txt
 
-      - name: Locate app bundle
+          echo "Extracted files: $(wc -l < analysis/app/all_files.txt)"
+
+      - name: Locate application bundle
         shell: bash
         run: |
           set -e
 
           find extracted/Payload \
-            -maxdepth 2 \
+            -maxdepth 3 \
             -type d \
             -name "*.app" \
             -print \
-            > analysis/app_bundles.txt
+            | sort \
+            > analysis/app/app_bundles.txt
 
-          cat analysis/app_bundles.txt
+          if [ ! -s analysis/app/app_bundles.txt ]; then
+            echo "::error::No .app bundle found"
+            exit 1
+          fi
 
-      - name: Copy app metadata
+          APP="$(head -n 1 analysis/app/app_bundles.txt)"
+
+          echo "$APP" > analysis/app/app_path.txt
+
+          echo "Application:"
+          echo "$APP"
+
+      - name: Application inventory
         shell: bash
         run: |
           set -e
 
-          APP="$(head -n 1 analysis/app_bundles.txt)"
+          APP="$(cat analysis/app/app_path.txt)"
 
-          if [ -z "$APP" ]; then
-            echo "No .app bundle found"
-            exit 1
-          fi
+          {
+            echo "===== APPLICATION ====="
+            echo "$APP"
+            echo
 
-          cp "$APP/Info.plist" analysis/resources/Info.plist \
-            2>/dev/null || true
+            echo "===== FILE ====="
+            file "$APP"
+            echo
 
-          if command -v plutil >/dev/null 2>&1; then
-            plutil -p "$APP/Info.plist" \
-              > analysis/resources/Info_plist_readable.txt \
-              2>&1 || true
-          fi
+            echo "===== FILE COUNT ====="
+            find "$APP" -type f | wc -l
+            echo
 
-          find "$APP" \
-            -type f \
-            -name "*.plist" \
-            -exec shasum -a 256 {} \; \
-            > analysis/resources/plist_hashes.txt \
-            2>/dev/null || true
+            echo "===== DIRECTORIES ====="
+            find "$APP" -type d | sort
+            echo
 
-      - name: Inspect code signing
+            echo "===== ALL FILES ====="
+            find "$APP" -type f | sort
+
+          } > analysis/app/inventory.txt
+
+      - name: Extract Info.plist
         shell: bash
         run: |
           set +e
 
-          APP="$(head -n 1 analysis/app_bundles.txt)"
+          APP="$(cat analysis/app/app_path.txt)"
 
-          {
-            echo "===== codesign display ====="
-            codesign -d -vvv "$APP"
+          cp "$APP/Info.plist" \
+            analysis/resources/Info.plist \
+            2>/dev/null || true
 
-            echo
-            echo "===== entitlements ====="
-            codesign -d --entitlements :- "$APP"
-
-            echo
-            echo "===== designated requirement ====="
-            codesign -d -r- "$APP"
-
-            echo
-            echo "===== verification ====="
-            codesign --verify -vvv "$APP"
-
-            echo
-            echo "===== security information ====="
-            security cms -D \
-              -i "$APP/embedded.mobileprovision"
-
-          } > analysis/signing/app_signing.txt 2>&1
-
-          codesign -d --entitlements :- "$APP" \
-            > analysis/signing/entitlements.plist \
+          plutil -p "$APP/Info.plist" \
+            > analysis/resources/Info_readable.txt \
             2>&1 || true
 
-          codesign -d -vvv "$APP" \
-            > analysis/signing/codesign_verbose.txt \
-            2>&1 || true
+          plutil -convert xml1 \
+            -o analysis/resources/Info.xml \
+            "$APP/Info.plist" \
+            2>/dev/null || true
 
-      - name: Find every Mach-O
+      - name: Find all Mach-O files
         shell: bash
         run: |
-          set -e
+          set +e
 
           : > analysis/macho/macho_files.txt
 
@@ -149,7 +153,7 @@ jobs:
           echo "Mach-O files:"
           cat analysis/macho/macho_files.txt
 
-      - name: Find dylibs and frameworks
+      - name: Find dylibs frameworks bundles
         shell: bash
         run: |
           set -e
@@ -175,7 +179,7 @@ jobs:
             | sort \
             > analysis/macho/bundles.txt
 
-      - name: Analyze Mach-O headers
+      - name: Mach-O complete analysis
         shell: bash
         run: |
           set +e
@@ -183,23 +187,23 @@ jobs:
           while IFS= read -r FILE; do
             [ -z "$FILE" ] && continue
 
-            NAME="$(basename "$FILE")"
-            SAFE="$(echo "$NAME" | tr '/ ' '__' | tr -cd '[:alnum:]_.-')"
+            BASE="$(basename "$FILE")"
+            SAFE="$(echo "$BASE" | tr ' /:' '___' | tr -cd '[:alnum:]_.-')"
 
-            OUT="analysis/headers/${SAFE}.txt"
+            OUT="analysis/headers/${SAFE}_headers.txt"
 
             {
-              echo "=================================================="
+              echo "============================================================"
               echo "FILE"
-              echo "=================================================="
+              echo "============================================================"
               echo "$FILE"
 
               echo
-              echo "===== file ====="
+              echo "===== FILE TYPE ====="
               file "$FILE"
 
               echo
-              echo "===== lipo ====="
+              echo "===== ARCHITECTURE ====="
               lipo -info "$FILE"
 
               echo
@@ -207,131 +211,249 @@ jobs:
               dwarfdump --uuid "$FILE"
 
               echo
-              echo "===== otool -hv ====="
+              echo "===== MACH HEADER ====="
               otool -hv "$FILE"
 
               echo
-              echo "===== linked libraries ====="
+              echo "===== LOAD COMMANDS ====="
+              otool -l "$FILE"
+
+              echo
+              echo "===== LINKED LIBRARIES ====="
               otool -L "$FILE"
 
               echo
-              echo "===== complete load commands ====="
-              otool -l "$FILE"
+              echo "===== DYLD INFO ====="
+              dyld_info "$FILE" 2>/dev/null || true
 
             } > "$OUT" 2>&1
 
           done < analysis/macho/macho_files.txt
 
-      - name: Extract load-command paths
+      - name: Extract sections
         shell: bash
         run: |
           set +e
 
-          : > analysis/search/load_commands.txt
-
           while IFS= read -r FILE; do
             [ -z "$FILE" ] && continue
 
-            echo "==================================================" \
-              >> analysis/search/load_commands.txt
-
-            echo "$FILE" \
-              >> analysis/search/load_commands.txt
+            BASE="$(basename "$FILE")"
+            SAFE="$(echo "$BASE" | tr ' /:' '___' | tr -cd '[:alnum:]_.-')"
 
             otool -l "$FILE" 2>/dev/null \
-              | grep -A6 -E \
-                "LC_LOAD_DYLIB|LC_LOAD_WEAK_DYLIB|LC_REEXPORT_DYLIB|LC_RPATH|LC_ID_DYLIB" \
-              >> analysis/search/load_commands.txt
-
-          done < analysis/macho/macho_files.txt
-
-      - name: Extract symbols
-        shell: bash
-        run: |
-          set +e
-
-          while IFS= read -r FILE; do
-            [ -z "$FILE" ] && continue
-
-            NAME="$(basename "$FILE")"
-            SAFE="$(echo "$NAME" | tr '/ ' '__' | tr -cd '[:alnum:]_.-')"
-
-            nm -arch arm64 -m "$FILE" \
-              > "analysis/symbols/${SAFE}_nm.txt" 2>&1
-
-            nm -arch arm64 -gU "$FILE" \
-              > "analysis/symbols/${SAFE}_exports.txt" 2>&1
-
-            nm -arch arm64 -u "$FILE" \
-              > "analysis/symbols/${SAFE}_imports.txt" 2>&1
-
-          done < analysis/macho/macho_files.txt
-
-      - name: Extract Objective-C metadata
-        shell: bash
-        run: |
-          set +e
-
-          while IFS= read -r FILE; do
-            [ -z "$FILE" ] && continue
-
-            NAME="$(basename "$FILE")"
-            SAFE="$(echo "$NAME" | tr '/ ' '__' | tr -cd '[:alnum:]_.-')"
-
-            OUT="analysis/objc/${SAFE}.txt"
-
-            {
-              echo "===== Objective-C symbols ====="
-
-              nm -arch arm64 "$FILE" 2>/dev/null \
-                | grep -E \
-                "OBJC|_OBJC_CLASS_|_OBJC_METACLASS_|objc_" \
-                || true
-
-              echo
-              echo "===== Objective-C strings ====="
-
-              strings -a "$FILE" 2>/dev/null \
-                | grep -Ei \
-                "objc|selector|class|method|protocol|delegate|viewcontroller" \
-                || true
-
-              echo
-              echo "===== runtime metadata ====="
-
-              nm -arch arm64 "$FILE" 2>/dev/null \
-                | grep -E \
-                "__objc_|__OBJC_" \
-                || true
-
-            } > "$OUT"
-
-          done < analysis/macho/macho_files.txt
-
-      - name: Extract strings
-        shell: bash
-        run: |
-          set +e
-
-          while IFS= read -r FILE; do
-            [ -z "$FILE" ] && continue
-
-            NAME="$(basename "$FILE")"
-            SAFE="$(echo "$NAME" | tr '/ ' '__' | tr -cd '[:alnum:]_.-')"
-
-            strings -a "$FILE" \
-              > "analysis/strings/${SAFE}_all.txt" \
-              2>&1
-
-            strings -a "$FILE" 2>/dev/null \
-              | grep -Ei \
-              "inject|dylib|framework|objc|swift|class|selector|method|manager|controller|render|player|network|http|https|api|debug|error|key|auth|license|version" \
-              > "analysis/strings/${SAFE}_interesting.txt" \
+              | grep -A20 -E \
+              "sectname|segname|vmaddr|vmsize|fileoff|filesize|prot" \
+              > "analysis/macho/${SAFE}_sections.txt" \
               || true
 
           done < analysis/macho/macho_files.txt
 
-      - name: Search binary for dynamic-loading APIs
+      - name: Extract dependencies
+        shell: bash
+        run: |
+          set +e
+
+          : > analysis/search/dependencies.txt
+
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+
+            {
+              echo "============================================================"
+              echo "$FILE"
+              echo "============================================================"
+              otool -L "$FILE" 2>&1 || true
+              echo
+            } >> analysis/search/dependencies.txt
+
+          done < analysis/macho/macho_files.txt
+
+      - name: Extract all symbols
+        shell: bash
+        run: |
+          set +e
+
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+
+            BASE="$(basename "$FILE")"
+            SAFE="$(echo "$BASE" | tr ' /:' '___' | tr -cd '[:alnum:]_.-')"
+
+            nm -arch arm64 -m "$FILE" \
+              > "analysis/symbols/${SAFE}_all.txt" \
+              2>&1 || true
+
+            nm -arch arm64 -g "$FILE" \
+              > "analysis/symbols/${SAFE}_global.txt" \
+              2>&1 || true
+
+            nm -arch arm64 -gU "$FILE" \
+              > "analysis/symbols/${SAFE}_exports.txt" \
+              2>&1 || true
+
+            nm -arch arm64 -u "$FILE" \
+              > "analysis/symbols/${SAFE}_imports.txt" \
+              2>&1 || true
+
+          done < analysis/macho/macho_files.txt
+
+      - name: Objective-C analysis
+        shell: bash
+        run: |
+          set +e
+
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+
+            BASE="$(basename "$FILE")"
+            SAFE="$(echo "$BASE" | tr ' /:' '___' | tr -cd '[:alnum:]_.-')"
+
+            {
+              echo "===== OBJECTIVE-C SYMBOLS ====="
+
+              nm -arch arm64 "$FILE" 2>/dev/null \
+                | grep -Ei \
+                "OBJC|_objc_|objc_" \
+                || true
+
+              echo
+              echo "===== CLASSES ====="
+
+              nm -arch arm64 "$FILE" 2>/dev/null \
+                | grep -E \
+                "_OBJC_CLASS_|_OBJC_METACLASS_" \
+                || true
+
+              echo
+              echo "===== METHODS ====="
+
+              nm -arch arm64 "$FILE" 2>/dev/null \
+                | grep -E \
+                "\-\[|\+\[" \
+                || true
+
+              echo
+              echo "===== IVARS ====="
+
+              nm -arch arm64 "$FILE" 2>/dev/null \
+                | grep -E \
+                "_OBJC_IVAR_" \
+                || true
+
+              echo
+              echo "===== OBJC SECTIONS ====="
+
+              otool -l "$FILE" 2>/dev/null \
+                | grep -A15 -E \
+                "__objc_|__DATA_CONST|__objc_const|__objc_data" \
+                || true
+
+            } > "analysis/objc/${SAFE}_objc.txt"
+
+          done < analysis/macho/macho_files.txt
+
+      - name: Swift analysis
+        shell: bash
+        run: |
+          set +e
+
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+
+            BASE="$(basename "$FILE")"
+            SAFE="$(echo "$BASE" | tr ' /:' '___' | tr -cd '[:alnum:]_.-')"
+
+            {
+              echo "===== SWIFT SYMBOLS ====="
+
+              nm -arch arm64 "$FILE" 2>/dev/null \
+                | grep -Ei \
+                "swift|Swift" \
+                || true
+
+              echo
+              echo "===== SWIFT STRINGS ====="
+
+              strings -a "$FILE" 2>/dev/null \
+                | grep -Ei \
+                "Swift|swift" \
+                || true
+
+            } > "analysis/swift/${SAFE}_swift.txt"
+
+          done < analysis/macho/macho_files.txt
+
+      - name: Extract all strings
+        shell: bash
+        run: |
+          set +e
+
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+
+            BASE="$(basename "$FILE")"
+            SAFE="$(echo "$BASE" | tr ' /:' '___' | tr -cd '[:alnum:]_.-')"
+
+            strings -a "$FILE" \
+              > "analysis/strings/${SAFE}_all.txt" \
+              2>&1 || true
+
+            strings -a -t x "$FILE" \
+              > "analysis/strings/${SAFE}_offsets.txt" \
+              2>&1 || true
+
+          done < analysis/macho/macho_files.txt
+
+      - name: Deep string categorization
+        shell: bash
+        run: |
+          set +e
+
+          for FILE in analysis/strings/*_all.txt; do
+            [ -f "$FILE" ] || continue
+
+            BASE="$(basename "$FILE" _all.txt)"
+
+            grep -Ei \
+              "inject|loader|load|dylib|framework|bundle|hook|patch|spawn|process|library" \
+              "$FILE" \
+              > "analysis/strings/${BASE}_loading.txt" \
+              || true
+
+            grep -Ei \
+              "http://|https://|api|server|endpoint|socket|tcp|udp|network|request|json" \
+              "$FILE" \
+              > "analysis/strings/${BASE}_network.txt" \
+              || true
+
+            grep -Ei \
+              "key|auth|token|license|subscription|premium|activate|verify|validation" \
+              "$FILE" \
+              > "analysis/strings/${BASE}_auth.txt" \
+              || true
+
+            grep -Ei \
+              "player|character|weapon|camera|render|shader|material|mesh|esp|aim|recoil|spread" \
+              "$FILE" \
+              > "analysis/strings/${BASE}_game.txt" \
+              || true
+
+            grep -Ei \
+              "debug|log|error|warning|assert|crash|exception" \
+              "$FILE" \
+              > "analysis/strings/${BASE}_debug.txt" \
+              || true
+
+            grep -E \
+              "^[[:space:]]*(https?|ftp)://|^[[:space:]]*[A-Za-z0-9._-]+\.[A-Za-z]{2,}" \
+              "$FILE" \
+              > "analysis/strings/${BASE}_urls.txt" \
+              || true
+
+          done
+
+      - name: Search dynamic loading references
         shell: bash
         run: |
           set +e
@@ -341,25 +463,58 @@ jobs:
           while IFS= read -r FILE; do
             [ -z "$FILE" ] && continue
 
-            echo "==================================================" \
-              >> analysis/search/dynamic_loading.txt
+            {
+              echo "============================================================"
+              echo "$FILE"
+              echo "============================================================"
 
-            echo "$FILE" \
-              >> analysis/search/dynamic_loading.txt
+              echo
+              echo "===== SYMBOL REFERENCES ====="
 
-            nm -arch arm64 "$FILE" 2>/dev/null \
-              | grep -Ei \
-              "dlopen|dlsym|dlclose|NSBundle|NSClassFromString|objc_getClass|class_get|method_get|performSelector" \
-              >> analysis/search/dynamic_loading.txt
+              nm -arch arm64 "$FILE" 2>/dev/null \
+                | grep -Ei \
+                "dlopen|dlsym|dlclose|NSBundle|NSClassFromString|objc_getClass|class_get|method_get|performSelector" \
+                || true
 
-            strings -a "$FILE" 2>/dev/null \
-              | grep -Ei \
-              "dlopen|dlsym|dlclose|NSBundle|NSClassFromString|@rpath|@loader_path|@executable_path" \
-              >> analysis/search/dynamic_loading.txt
+              echo
+              echo "===== STRING REFERENCES ====="
+
+              strings -a "$FILE" 2>/dev/null \
+                | grep -Ei \
+                "dlopen|dlsym|dlclose|NSBundle|NSClassFromString|@rpath|@loader_path|@executable_path" \
+                || true
+
+              echo
+
+            } >> analysis/search/dynamic_loading.txt
 
           done < analysis/macho/macho_files.txt
 
-      - name: Disassemble ARM64
+      - name: Search interesting APIs
+        shell: bash
+        run: |
+          set +e
+
+          : > analysis/search/interesting_apis.txt
+
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+
+            {
+              echo "============================================================"
+              echo "$FILE"
+              echo "============================================================"
+
+              nm -arch arm64 "$FILE" 2>/dev/null \
+                | grep -Ei \
+                "malloc|free|memcpy|memmove|mprotect|vm_|mach_|pthread|dispatch_|objc_msgSend|method_|class_|CG|CA|UI|NS" \
+                || true
+
+            } >> analysis/search/interesting_apis.txt
+
+          done < analysis/macho/macho_files.txt
+
+      - name: ARM64 disassembly
         shell: bash
         run: |
           set +e
@@ -369,16 +524,16 @@ jobs:
           while IFS= read -r FILE; do
             [ -z "$FILE" ] && continue
 
-            NAME="$(basename "$FILE")"
-            SAFE="$(echo "$NAME" | tr '/ ' '__' | tr -cd '[:alnum:]_.-')"
+            BASE="$(basename "$FILE")"
+            SAFE="$(echo "$BASE" | tr ' /:' '___' | tr -cd '[:alnum:]_.-')"
 
             "$OBJDUMP" \
               --macho \
               --arch=arm64 \
               --disassemble \
               "$FILE" \
-              > "analysis/disasm/${SAFE}_arm64.asm" \
-              2>&1
+              > "analysis/disasm/${SAFE}_full.asm" \
+              2>&1 || true
 
             "$OBJDUMP" \
               --macho \
@@ -386,24 +541,85 @@ jobs:
               --section=__TEXT,__text \
               "$FILE" \
               > "analysis/disasm/${SAFE}_text.asm" \
-              2>&1
+              2>&1 || true
 
           done < analysis/macho/macho_files.txt
 
-      - name: Extract resources
+      - name: Extract Objective-C selectors
+        shell: bash
+        run: |
+          set +e
+
+          : > analysis/search/selectors.txt
+
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+
+            {
+              echo "============================================================"
+              echo "$FILE"
+              echo "============================================================"
+
+              strings -a "$FILE" 2>/dev/null \
+                | grep -E \
+                "^[A-Za-z_][A-Za-z0-9_]*(:[A-Za-z0-9_]+)*:?$" \
+                | sort -u \
+                || true
+
+            } >> analysis/search/selectors.txt
+
+          done < analysis/macho/macho_files.txt
+
+      - name: Extract entitlements and signing
+        shell: bash
+        run: |
+          set +e
+
+          APP="$(cat analysis/app/app_path.txt)"
+
+          {
+            echo "===== CODESIGN ====="
+            codesign -d -vvv "$APP"
+
+            echo
+            echo "===== ENTITLEMENTS ====="
+            codesign -d --entitlements :- "$APP"
+
+            echo
+            echo "===== REQUIREMENT ====="
+            codesign -d -r- "$APP"
+
+            echo
+            echo "===== VERIFY ====="
+            codesign --verify --deep --strict --verbose=4 "$APP"
+
+          } > analysis/signing/codesign.txt 2>&1 || true
+
+          codesign -d --entitlements :- "$APP" \
+            > analysis/signing/entitlements.plist \
+            2>&1 || true
+
+          if [ -f "$APP/embedded.mobileprovision" ]; then
+            security cms -D \
+              -i "$APP/embedded.mobileprovision" \
+              > analysis/signing/mobileprovision.plist \
+              2>&1 || true
+          fi
+
+      - name: Resource inventory
         shell: bash
         run: |
           set -e
 
-          APP="$(head -n 1 analysis/app_bundles.txt)"
+          APP="$(cat analysis/app/app_path.txt)"
 
-          find "$APP" \
-            -type f \
+          find "$APP" -type f \
             \( \
               -name "*.png" \
               -o -name "*.jpg" \
               -o -name "*.jpeg" \
               -o -name "*.gif" \
+              -o -name "*.webp" \
               -o -name "*.json" \
               -o -name "*.plist" \
               -o -name "*.strings" \
@@ -412,32 +628,48 @@ jobs:
               -o -name "*.html" \
               -o -name "*.js" \
               -o -name "*.css" \
+              -o -name "*.metal" \
+              -o -name "*.shader" \
             \) \
             -print \
             | sort \
             > analysis/resources/resource_files.txt
 
+          find "$APP" -type f \
+            -name "*.lproj" \
+            -print \
+            > analysis/resources/localizations.txt \
+            2>/dev/null || true
+
+      - name: Extract readable source-like resources
+        shell: bash
+        run: |
+          set +e
+
+          APP="$(cat analysis/app/app_path.txt)"
+
           while IFS= read -r FILE; do
             [ -z "$FILE" ] && continue
 
-            NAME="$(basename "$FILE")"
+            REL="${FILE#$APP/}"
+            SAFE="$(echo "$REL" | tr '/ ' '__' | tr -cd '[:alnum:]_.-')"
 
             case "$FILE" in
+              *.json|*.txt|*.strings|*.xml|*.html|*.js|*.css|*.metal|*.shader)
+                cp "$FILE" \
+                  "analysis/resources/${SAFE}" \
+                  2>/dev/null || true
+                ;;
               *.plist)
                 plutil -p "$FILE" \
-                  > "analysis/resources/${NAME}.txt" \
+                  > "analysis/resources/${SAFE}.readable.txt" \
                   2>&1 || true
-                ;;
-              *.json|*.txt|*.strings|*.xml|*.html|*.js|*.css)
-                cp "$FILE" \
-                  "analysis/resources/${NAME}" \
-                  2>/dev/null || true
                 ;;
             esac
 
           done < analysis/resources/resource_files.txt
 
-      - name: Hash all extracted files
+      - name: SHA256 inventory
         shell: bash
         run: |
           set -e
@@ -449,77 +681,125 @@ jobs:
             | xargs -0 shasum -a 256 \
             > analysis/hashes/sha256.txt
 
-      - name: Generate master report
+          shasum -a 256 Droze.ipa \
+            > analysis/hashes/Droze_ipa_sha256.txt
+
+      - name: Build master report
         shell: bash
         run: |
           set +e
 
           {
-            echo "# DROZE IPA - MASTER STATIC ANALYSIS"
+            echo "============================================================"
+            echo "DROZE IPA - DEEP STATIC ANALYSIS"
+            echo "============================================================"
             echo
             echo "Generated: $(date -u)"
             echo
-
-            echo "## App bundles"
-            cat analysis/app_bundles.txt
-
+            echo "===== APP ====="
+            cat analysis/app/app_path.txt
             echo
-            echo "## Mach-O"
+            echo "===== MACH-O FILES ====="
             cat analysis/macho/macho_files.txt
-
             echo
-            echo "## Dylibs"
+            echo "===== DYLIBS ====="
             cat analysis/macho/dylibs.txt
-
             echo
-            echo "## Frameworks"
+            echo "===== FRAMEWORKS ====="
             cat analysis/macho/frameworks.txt
-
             echo
-            echo "## Bundles"
+            echo "===== BUNDLES ====="
             cat analysis/macho/bundles.txt
-
             echo
-            echo "## Dynamic loading references"
+            echo "===== DYNAMIC LOADING ====="
             cat analysis/search/dynamic_loading.txt
-
             echo
-            echo "## Load commands"
-            cat analysis/search/load_commands.txt
-
+            echo "===== DEPENDENCIES ====="
+            cat analysis/search/dependencies.txt
             echo
-            echo "## Potentially interesting symbols"
+            echo "===== INTERESTING APIs ====="
+            cat analysis/search/interesting_apis.txt
+            echo
+            echo "===== SELECTORS ====="
+            cat analysis/search/selectors.txt
+
+          } > analysis/report/MASTER_REPORT.txt
+
+      - name: Generate focused findings
+        shell: bash
+        run: |
+          set +e
+
+          {
+            echo "DROZE - IMPORTANT FINDINGS"
+            echo "Generated: $(date -u)"
+            echo
+
+            echo "===== INJECTION / LOADING ====="
             grep -R -Ei \
-              "inject|hook|dylib|manager|controller|render|player|network|auth|key|license" \
-              analysis/symbols \
+              "inject|injection|loader|loading|dlopen|dlsym|dylib|NSBundle|@rpath|@loader_path|@executable_path" \
+              analysis \
               2>/dev/null \
-              | head -20000
+              | head -30000 \
+              || true
 
             echo
-            echo "## Potentially interesting strings"
+            echo "===== OBJECTIVE-C ====="
             grep -R -Ei \
-              "inject|dylib|hook|manager|controller|render|player|network|auth|key|license" \
+              "OBJC_CLASS|OBJC_METACLASS|OBJC_IVAR|-\[|\+\[" \
+              analysis/objc analysis/symbols \
+              2>/dev/null \
+              | head -30000 \
+              || true
+
+            echo
+            echo "===== NETWORK ====="
+            grep -R -Ei \
+              "https?://|api|endpoint|socket|tcp|udp|request|json" \
               analysis/strings \
               2>/dev/null \
-              | head -20000
+              | head -30000 \
+              || true
 
-          } > analysis/IMPORTANT_FINDINGS.txt
+            echo
+            echo "===== AUTH / LICENSE ====="
+            grep -R -Ei \
+              "key|auth|token|license|subscription|premium|activate|verify|validation" \
+              analysis/strings \
+              2>/dev/null \
+              | head -30000 \
+              || true
 
-      - name: Create archive
+            echo
+            echo "===== GAME / RUNTIME ====="
+            grep -R -Ei \
+              "player|character|weapon|camera|render|shader|material|mesh|esp|aim|recoil|spread" \
+              analysis/strings analysis/symbols \
+              2>/dev/null \
+              | head -30000 \
+              || true
+
+          } > analysis/report/IMPORTANT_FINDINGS.txt
+
+      - name: Package complete analysis
         shell: bash
         run: |
           set -e
 
           zip -qr \
-            Droze-full-analysis.zip \
+            Droze-analysis.zip \
             analysis
 
-          ls -lh Droze-full-analysis.zip
+          echo "======================================"
+          echo "Analysis complete"
+          echo "======================================"
+          du -sh analysis
+          ls -lh Droze-analysis.zip
 
-      - name: Upload artifact
+      - name: Upload complete analysis
         uses: actions/upload-artifact@v4
         with:
-          name: Droze-full-analysis
-          path: Droze-full-analysis.zip
+          name: Droze-analysis
+          path: Droze-analysis.zip
           retention-days: 14
           if-no-files-found: error
