@@ -1,10 +1,10 @@
-name: Inject Dylib into Droze IPA
+name: Inject Dylib into Droze IPA (Rust)
 
 on:
   workflow_dispatch:
     inputs:
       dylib_name:
-        description: 'Имя вашего .dylib файла (например, cheat.dylib)'
+        description: 'Имя твоего .dylib файла (например, cheat.dylib)'
         required: true
         default: 'cheat.dylib'
 
@@ -16,14 +16,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build insert_dylib tool
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust insert-dylib tool
         run: |
-          # Клонируем и компилируем инструмент для патча Mach-O заголовков под Linux
-          git clone https://github.com/Tyilo/insert_dylib.git
-          cd insert_dylib
-          g++ insert_dylib.c -o insert_dylib
-          sudo cp insert_dylib /usr/local/bin/
-          cd ..
+          cargo install insert-dylib
 
       - name: Unpack Droze.ipa
         run: |
@@ -34,7 +32,7 @@ jobs:
           mkdir -p extracted
           unzip -q Droze.ipa -d extracted/
 
-      - name: Inject Dylib into Droze Binary
+      - name: Inject Dylib via Rust insert-dylib
         run: |
           APP_PATH=$(find extracted/Payload -name "*.app" | head -n 1)
           APP_NAME=$(basename "$APP_PATH" .app)
@@ -42,15 +40,16 @@ jobs:
           DYLIB="${{ github.event.inputs.dylib_name }}"
           
           if [ ! -f "$DYLIB" ]; then
-            echo "Ошибка: файл ддилибки '$DYLIB' не найден в репозитории!"
+            echo "Ошибка: файл ддилибки '$DYLIB' не найден в корне репозитория!"
             exit 1
-          }
+          fi
 
           echo "Копируем $DYLIB внутрь бандла приложения..."
           cp "$DYLIB" "$APP_PATH/"
 
-          echo "Выполняем инъекцию через insert_dylib..."
-          insert_dylib --inplace --weak "@executable_path/$DYLIB" "$BINARY"
+          echo "Выполняем инъекцию через Rust insert-dylib..."
+          # Флаг --inplace патчит файл на месте, --weak добавляет слабую зависимость, --all-yes автоподтверждает запросы
+          insert-dylib --inplace --weak --all-yes "@executable_path/$DYLIB" "$BINARY"
           
           echo "Инъекция успешно завершена!"
 
