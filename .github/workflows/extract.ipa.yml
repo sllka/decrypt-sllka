@@ -1,12 +1,7 @@
-name: Extract and Analyze IPA
+name: Extract and Dump Droze IPA
 
 on:
   workflow_dispatch:
-    inputs:
-      ipa_url:
-        description: 'Прямая ссылка на .ipa файл (или оставьте пустым, если загружаете в репозиторий)'
-        required: false
-        type: string
 
 jobs:
   analyze:
@@ -24,46 +19,38 @@ jobs:
       - name: Prepare environment
         run: |
           mkdir -p analysis/strings analysis/app analysis/resources
-          
-      - name: Find or download IPA
+
+      - name: Locate Droze.ipa
         run: |
-          # Ищем .ipa файл в корне репозитория или качаем по ссылке
-          IPA_FILE=$(find . -maxdepth 1 -name "*.ipa" | head -n 1)
+          IPA_FILE=$(find . -maxdepth 2 -iname "Droze.ipa" | head -n 1)
           
-          if [ -n "$inputs.ipa_url" ]; then
-            echo "Скачивание IPA по ссылке..."
-            curl -L -o app.ipa "${{ inputs.ipa_url }}"
-          elif [ -n "$IPA_FILE" ]; then
-            echo "Найден локальный IPA: $IPA_FILE"
-            cp "$IPA_FILE" app.ipa
+          if [ -n "$IPA_FILE" ]; then
+            echo "Найден файл: $IPA_FILE"
+            cp "$IPA_FILE" ./Droze.ipa
           else
-            echo "Ошибка: .ipa файл не найден в репозитории и не указана ссылка!"
+            echo "Ошибка: файл Droze.ipa не найден в репозитории!"
             exit 1
           fi
 
-      - name: Unpack IPA
+      - name: Unpack Droze.ipa
         run: |
           mkdir -p extracted
-          unzip -q app.ipa -d extracted/
+          unzip -q Droze.ipa -d extracted/
           
-          # Находим путь к .app папке
           APP_PATH=$(find extracted/Payload -name "*.app" | head -n 1)
-          echo "APP_PATH=$APP_PATH" >> $GITHUB_ENV
-          echo "Распаковано в: $APP_PATH"
+          echo "APP_PATH=$APP_PATH"
+          echo "Распаковано успешно!"
 
       - name: Extract Info.plist and structure
         run: |
           APP_PATH=$(find extracted/Payload -name "*.app" | head -n 1)
-          
-          # Сохраняем список всех файлов
           find "$APP_PATH" -type f > analysis/app/all_files.txt
           echo "$APP_PATH" > analysis/app/app_path.txt
           
-          # Конвертируем Info.plist в читаемый текст (если он в бинарном формате)
           PLIST_FILE="$APP_PATH/Info.plist"
           if [ -f "$PLIST_FILE" ]; then
             python3 -c "
-import plistlib, sys
+import plistlib
 try:
     with open('$PLIST_FILE', 'rb') as f:
         data = plistlib.load(f)
@@ -75,25 +62,24 @@ except Exception as e:
 "
           fi
 
-      - name: Extract Strings from Binary
+      - name: Extract Strings from Binary (Dump)
         run: |
           APP_PATH=$(find extracted/Payload -name "*.app" | head -n 1)
           APP_NAME=$(basename "$APP_PATH" .app)
           BINARY="$APP_PATH/$APP_NAME"
           
           if [ -f "$BINARY" ]; then
-            echo "Извлечение строк из бинарника..."
-            # Вытаскиваем читаемые строки длиннее 4 символов
+            echo "Делаем дамп строк из бинарника $BINARY..."
             strings "$BINARY" > analysis/strings/Droze_all.txt
-            
-            # Фильтруем полезное (ссылки, урлы)
             grep -iE "https?://|http?://" analysis/strings/Droze_all.txt > analysis/strings/Droze_urls.txt || true
+            echo "Дамп строк успешно завершен!"
           else
             echo "Главный бинарник не найден!"
+            exit 1
           fi
 
       - name: Upload Analysis Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ipa-analysis-report
+          name: droze-analysis-report
           path: analysis/
