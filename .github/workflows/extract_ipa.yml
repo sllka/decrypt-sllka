@@ -1,85 +1,33 @@
-name: Extract and Dump Droze IPA
+name: Extract IPA
 
 on:
   workflow_dispatch:
 
 jobs:
-  analyze:
+  run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Prepare environment
+      - name: Unpack and Dump
         run: |
-          mkdir -p analysis/strings analysis/app analysis/resources
-
-      - name: Locate Droze.ipa
-        run: |
-          IPA_FILE=$(find . -maxdepth 2 -iname "Droze.ipa" | head -n 1)
-          
-          if [ -n "$IPA_FILE" ]; then
-            echo "Найден файл: $IPA_FILE"
-            cp "$IPA_FILE" ./Droze.ipa
+          ls -la
+          if [ -f "Droze.ipa" ]; then
+            echo "Файл Droze.ipa найден!"
+            unzip -q Droze.ipa -d extracted/
+            APP_PATH=$(find extracted/Payload -name "*.app" | head -n 1)
+            BINARY="$APP_PATH/$(basename "$APP_PATH" .app)"
+            strings "$BINARY" > strings_dump.txt
+            mkdir -p output
+            mv strings_dump.txt output/
           else
-            echo "Ошибка: файл Droze.ipa не найден в репозитории!"
+            echo "Ошибка: файл Droze.ipa не найден в корне репозитория!"
             exit 1
           fi
 
-      - name: Unpack Droze.ipa
-        run: |
-          mkdir -p extracted
-          unzip -q Droze.ipa -d extracted/
-          
-          APP_PATH=$(find extracted/Payload -name "*.app" | head -n 1)
-          echo "APP_PATH=$APP_PATH"
-          echo "Распаковано успешно!"
-
-      - name: Extract Info.plist and structure
-        run: |
-          APP_PATH=$(find extracted/Payload -name "*.app" | head -n 1)
-          find "$APP_PATH" -type f > analysis/app/all_files.txt
-          echo "$APP_PATH" > analysis/app/app_path.txt
-          
-          PLIST_FILE="$APP_PATH/Info.plist"
-          if [ -f "$PLIST_FILE" ]; then
-            python3 -c "
-import plistlib
-try:
-    with open('$PLIST_FILE', 'rb') as f:
-        data = plistlib.load(f)
-    with open('analysis/resources/Info_readable.txt', 'w') as out:
-        out.write(str(data))
-    print('Info.plist успешно расшифрован.')
-except Exception as e:
-    print('Ошибка чтения plist:', e)
-"
-          fi
-
-      - name: Extract Strings from Binary (Dump)
-        run: |
-          APP_PATH=$(find extracted/Payload -name "*.app" | head -n 1)
-          APP_NAME=$(basename "$APP_PATH" .app)
-          BINARY="$APP_PATH/$APP_NAME"
-          
-          if [ -f "$BINARY" ]; then
-            echo "Делаем дамп строк из бинарника $BINARY..."
-            strings "$BINARY" > analysis/strings/Droze_all.txt
-            grep -iE "https?://|http?://" analysis/strings/Droze_all.txt > analysis/strings/Droze_urls.txt || true
-            echo "Дамп строк успешно завершен!"
-          else
-            echo "Главный бинарник не найден!"
-            exit 1
-          fi
-
-      - name: Upload Analysis Artifacts
+      - name: Upload result
         uses: actions/upload-artifact@v4
         with:
-          name: droze-analysis-report
-          path: analysis/
+          name: dump
+          path: output/
