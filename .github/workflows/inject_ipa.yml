@@ -1,0 +1,68 @@
+name: Inject Dylib into Droze IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      dylib_name:
+        description: 'Имя вашего .dylib файла (например, cheat.dylib)'
+        required: true
+        default: 'cheat.dylib'
+
+jobs:
+  inject:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build insert_dylib tool
+        run: |
+          # Клонируем и компилируем инструмент для патча Mach-O заголовков под Linux
+          git clone https://github.com/Tyilo/insert_dylib.git
+          cd insert_dylib
+          g++ insert_dylib.c -o insert_dylib
+          sudo cp insert_dylib /usr/local/bin/
+          cd ..
+
+      - name: Unpack Droze.ipa
+        run: |
+          if [ ! -f "Droze.ipa" ]; then
+            echo "Ошибка: файл Droze.ipa не найден в корне репозитория!"
+            exit 1
+          fi
+          mkdir -p extracted
+          unzip -q Droze.ipa -d extracted/
+
+      - name: Inject Dylib into Droze Binary
+        run: |
+          APP_PATH=$(find extracted/Payload -name "*.app" | head -n 1)
+          APP_NAME=$(basename "$APP_PATH" .app)
+          BINARY="$APP_PATH/$APP_NAME"
+          DYLIB="${{ github.event.inputs.dylib_name }}"
+          
+          if [ ! -f "$DYLIB" ]; then
+            echo "Ошибка: файл ддилибки '$DYLIB' не найден в репозитории!"
+            exit 1
+          }
+
+          echo "Копируем $DYLIB внутрь бандла приложения..."
+          cp "$DYLIB" "$APP_PATH/"
+
+          echo "Выполняем инъекцию через insert_dylib..."
+          insert_dylib --inplace --weak "@executable_path/$DYLIB" "$BINARY"
+          
+          echo "Инъекция успешно завершена!"
+
+      - name: Repackage IPA
+        run: |
+          cd extracted
+          zip -qr ../Droze_Injected.ipa *
+          cd ..
+          rm -rf extracted
+
+      - name: Upload Injected IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Droze-Injected-IPA
+          path: Droze_Injected.ipa
