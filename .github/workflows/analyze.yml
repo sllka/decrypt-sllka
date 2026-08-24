@@ -1,10 +1,10 @@
-name: Analyze IPA
+name: Analyze IPA and txt
 
 on:
   workflow_dispatch:
     inputs:
       ipa:
-        description: "Имя IPA в корне репозитория"
+        description: "IPA filename in repository root"
         required: true
         default: "Droze.ipa"
 
@@ -13,99 +13,292 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y unzip file binutils llvm strings
+          sudo apt-get install -y unzip file binutils llvm wget curl jq
 
-      - name: Download Ghidra
+      - name: Download latest Ghidra
         run: |
-          wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.0_build/ghidra_12.0_PUBLIC_20260101.zip \
-            -O ghidra.zip
+          GHIDRA_URL=$(curl -s \
+            https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
+            | jq -r '.assets[] |
+              select(.name | endswith(".zip")) |
+              .browser_download_url' \
+            | head -n 1)
+
+          echo "Downloading:"
+          echo "$GHIDRA_URL"
+
+          wget -q "$GHIDRA_URL" -O ghidra.zip
+
           unzip -q ghidra.zip
-          mv ghidra_* ghidra
+
+          GHIDRA_DIR=$(find . -maxdepth 1 -type d -name "ghidra_*" | head -n 1)
+
+          if [ -z "$GHIDRA_DIR" ]; then
+            echo "Ghidra directory not found"
+            exit 1
+          fi
+
+          mv "$GHIDRA_DIR" ghidra
+
+          echo "Ghidra installed."
+
+      - name: Check IPA
+        run: |
+          IPA="${{ github.event.inputs.ipa }}"
+
+          if [ ! -f "$IPA" ]; then
+            echo "ERROR: IPA not found: $IPA"
+            echo
+            find . -maxdepth 2 -type f
+            exit 1
+          fi
+
+          ls -lh "$IPA"
 
       - name: Extract IPA
         run: |
-          mkdir -p analysis
-          unzip -q "${{ github.event.inputs.ipa }}" -d analysis/ipa
+          mkdir -p analysis/ipa
+
+          unzip -q \
+            "${{ github.event.inputs.ipa }}" \
+            -d analysis/ipa
 
       - name: Find Mach-O files
         run: |
           mkdir -p analysis/macho
 
-          find analysis/ipa/Payload -type f -print0 |
+          find analysis/ipa -type f -print0 |
           while IFS= read -r -d '' file; do
             if file "$file" | grep -q "Mach-O"; then
-              echo "$file" | tee -a analysis/macho/files.txt
+              echo "$file" >> analysis/macho/files.txt
             fi
           done
 
-      - name: Basic Mach-O information
+          echo "Mach-O files:"
+          cat analysis/macho/files.txt || true
+
+      - name: Create Ghidra decompiler script
         run: |
-          mkdir -p analysis/info
+          mkdir -p ghidra_scripts
 
-          while IFS= read -r file; do
-            echo "==================================================" >> analysis/info/macho.txt
-            echo "FILE: $file" >> analysis/info/macho.txt
-            echo "==================================================" >> analysis/info/macho.txt
+          cat > ghidra_scripts/ExportC.py <<'PY'
+          # Export decompiled functions to a .c.txt file.
 
-            file "$file" >> analysis/info/macho.txt 2>&1 || true
+          from ghidra.app.decompiler import DecompInterface
+          from ghidra.util.task import ConsoleTaskMonitor
+          from ghidra.program.model.listing import Function
+          import os
 
-            echo >> analysis/info/macho.txt
-            echo "LLVM OBJECT INFO:" >> analysis/info/macho.txt
-            llvm-objdump --macho --private-headers "$file" \
-              >> analysis/info/macho.txt 2>&1 || true
+          if currentProgram is None:
+              print("No program loaded.")
+              exit()
 
-            echo >> analysis/info/macho.txt
-            echo "DEPENDENCIES:" >> analysis/info/macho.txt
-            llvm-objdump --macho --dylibs-used "$file" \
-              >> analysis/info/macho.txt 2>&1 || true
+          program = currentProgram
 
-            echo >> analysis/info/macho.txt
-            echo "STRINGS:" >> analysis/info/macho.txt
-            strings "$file" | head -n 5000 \
-              >> analysis/info/macho.txt 2>&1 || true
+          input_name = program.getName()
 
-          done < analysis/macho/files.txt
+          output_dir = os.environ.get(
+              "GHIDRA_OUTPUT_DIR",
+              "."
+          )
 
-      - name: Prepare Ghidra project
+          if not os.path.exists(output_dir):
+              os.makedirs(output_dir)
+
+          output_file = os.path.join(
+              output_dir,
+              input_name + ".c.txt"
+          )
+
+          print("Exporting decompiled code to:")
+          print(output_file)
+
+          decompiler = DecompInterface()
+
+          decompiler.openProgram(program)
+
+          monitor = ConsoleTaskMonitor()
+
+          fm = program.getFunctionManager()
+
+          functions = fm.getFunctions(True)
+
+          count = 0
+
+          with open(output_file, "w", encoding="utf-8") as out:
+
+              out.write("/*\n")
+              out.write(" Ghidra decompilation\n")
+              out.write(" Binary: " + input_name + "\n")
+              out.write("*/\n\n")
+
+              for function in functions:
+
+                  if monitor.isCancelled():
+                      break
+
+                  try:
+                      result = decompiler.decompileFunction(
+                          function,
+                          60,
+                          monitor
+                      )
+
+                      if result is None:
+                          continue
+
+                      if not result.decompileCompleted():
+                          continue
+
+                      decompiled = result.getDecompiledFunction()
+
+                      if decompiled is None:
+                          continue
+
+                      code = decompiled.getC()
+
+                      out.write(
+                          "\n\n"
+                          "/* ================================================== */\n"
+                      )
+
+                      out.write(
+                          "/* Function: "
+                          + function.getName()
+                          + " */\n"
+                      )
+
+                      out.write(
+                          "/* Address: "
+                          + str(function.getEntryPoint())
+                          + " */\n"
+                      )
+
+                      out.write(
+                          "/* ================================================== */\n\n"
+                      )
+
+                      out.write(code)
+                      out.write("\n")
+
+                      count += 1
+
+                      if count % 100 == 0:
+                          print(
+                              "Exported functions: "
+                              + str(count)
+                          )
+
+                  except Exception as e:
+                      print(
+                          "Failed to decompile "
+                          + function.getName()
+                          + ": "
+                          + str(e)
+                      )
+
+          print(
+              "Finished. Exported "
+              + str(count)
+              + " functions."
+          )
+
+          decompiler.dispose()
+          PY
+
+      - name: Prepare Ghidra directories
         run: |
           mkdir -p analysis/ghidra_project
+          mkdir -p analysis/c_code
           mkdir -p analysis/ghidra_output
 
+      - name: Run Ghidra
+        run: |
           while IFS= read -r file; do
-            base="$(basename "$file")"
 
-            "$PWD/ghidra/support/analyzeHeadless" \
+            NAME=$(basename "$file")
+
+            echo
+            echo "========================================"
+            echo "Analyzing: $file"
+            echo "========================================"
+
+            GHIDRA_OUTPUT_DIR="$PWD/analysis/c_code" \
+            ./ghidra/support/analyzeHeadless \
               "$PWD/analysis/ghidra_project" \
-              "$base" \
+              "$NAME" \
               -import "$PWD/$file" \
-              -analysisTimeoutPerFile 300 \
               -overwrite \
-              2>&1 | tee -a analysis/ghidra_output/ghidra.log || true
+              -analysisTimeoutPerFile 900 \
+              -postScript ExportC.py \
+              -scriptPath "$PWD/ghidra_scripts" \
+              2>&1 | tee \
+              -a analysis/ghidra_output/ghidra.log || true
 
           done < analysis/macho/files.txt
 
-      - name: Export useful information
+      - name: Create Mach-O report
         run: |
           mkdir -p analysis/report
 
-          cp analysis/macho/files.txt analysis/report/ 2>/dev/null || true
-          cp analysis/info/macho.txt analysis/report/ 2>/dev/null || true
-          cp analysis/ghidra_output/ghidra.log analysis/report/ 2>/dev/null || true
+          while IFS= read -r file; do
 
-          echo "Analysis completed." > analysis/report/README.txt
-          echo "The Ghidra project contains the imported Mach-O binaries." >> analysis/report/README.txt
-          echo "The report contains architecture, Mach-O headers, dependencies and strings." >> analysis/report/README.txt
+            echo "========================================" \
+              >> analysis/report/macho.txt
+
+            echo "FILE: $file" \
+              >> analysis/report/macho.txt
+
+            echo "========================================" \
+              >> analysis/report/macho.txt
+
+            file "$file" \
+              >> analysis/report/macho.txt 2>&1 || true
+
+            echo >> analysis/report/macho.txt
+
+            echo "DYLIBS:" \
+              >> analysis/report/macho.txt
+
+            llvm-objdump \
+              --macho \
+              --dylibs-used \
+              "$file" \
+              >> analysis/report/macho.txt 2>&1 || true
+
+            echo >> analysis/report/macho.txt
+
+            echo "STRINGS:" \
+              >> analysis/report/macho.txt
+
+            strings "$file" |
+              head -n 10000 \
+              >> analysis/report/macho.txt 2>&1 || true
+
+            echo >> analysis/report/macho.txt
+
+          done < analysis/macho/files.txt
+
+      - name: List generated C files
+        run: |
+          echo "Generated files:"
+          find analysis/c_code -type f -print
 
       - name: Pack results
         run: |
           cd analysis
-          zip -qr ../ipa-analysis.zip report ghidra_project
+
+          zip -qr ../ipa-analysis.zip \
+            report \
+            macho \
+            c_code \
+            ghidra_output
 
       - name: Upload analysis
         uses: actions/upload-artifact@v4
