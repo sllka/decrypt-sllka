@@ -1,10 +1,10 @@
-name: Analyze IPA
+name: Analyze IPA main
 
 on:
   workflow_dispatch:
     inputs:
       ipa:
-        description: "Имя IPA в корне репозитория"
+        description: "IPA filename in repository root"
         required: true
         default: "Droze.ipa"
 
@@ -13,99 +13,191 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y unzip file binutils llvm strings
+          sudo apt-get install -y \
+            unzip \
+            file \
+            binutils \
+            llvm \
+            wget \
+            curl \
+            jq
 
-      - name: Download Ghidra
+      - name: Download latest Ghidra
         run: |
-          wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.0_build/ghidra_12.0_PUBLIC_20260101.zip \
-            -O ghidra.zip
+          GHIDRA_URL=$(curl -s https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
+            | jq -r '.assets[] | select(.name | endswith(".zip")) | .browser_download_url' \
+            | head -n 1)
+
+          echo "Ghidra URL: $GHIDRA_URL"
+
+          wget -q "$GHIDRA_URL" -O ghidra.zip
+
           unzip -q ghidra.zip
-          mv ghidra_* ghidra
+
+          GHIDRA_DIR=$(find . -maxdepth 1 -type d -name "ghidra_*" | head -n 1)
+
+          if [ -z "$GHIDRA_DIR" ]; then
+            echo "Ghidra directory not found"
+            exit 1
+          fi
+
+          mv "$GHIDRA_DIR" ghidra
+
+          echo "Ghidra installed:"
+          ls -la ghidra
+
+      - name: Check IPA
+        run: |
+          IPA="${{ github.event.inputs.ipa }}"
+
+          if [ ! -f "$IPA" ]; then
+            echo "ERROR: IPA not found: $IPA"
+            echo
+            echo "Files in repository:"
+            find . -maxdepth 2 -type f
+            exit 1
+          fi
+
+          echo "Found IPA:"
+          ls -lh "$IPA"
 
       - name: Extract IPA
         run: |
-          mkdir -p analysis
-          unzip -q "${{ github.event.inputs.ipa }}" -d analysis/ipa
+          mkdir -p analysis/ipa
 
-      - name: Find Mach-O files
+          unzip -q "${{ github.event.inputs.ipa }}" \
+            -d analysis/ipa
+
+          echo "IPA contents:"
+          find analysis/ipa -maxdepth 3 -type f | head -n 100
+
+      - name: Find Mach-O binaries
         run: |
           mkdir -p analysis/macho
 
-          find analysis/ipa/Payload -type f -print0 |
+          find analysis/ipa -type f -print0 |
           while IFS= read -r -d '' file; do
+
             if file "$file" | grep -q "Mach-O"; then
               echo "$file" | tee -a analysis/macho/files.txt
             fi
+
           done
 
-      - name: Basic Mach-O information
+          echo
+          echo "Mach-O files found:"
+          cat analysis/macho/files.txt || true
+
+      - name: Analyze Mach-O files
         run: |
-          mkdir -p analysis/info
+          mkdir -p analysis/report
 
           while IFS= read -r file; do
-            echo "==================================================" >> analysis/info/macho.txt
-            echo "FILE: $file" >> analysis/info/macho.txt
-            echo "==================================================" >> analysis/info/macho.txt
 
-            file "$file" >> analysis/info/macho.txt 2>&1 || true
+            echo "============================================" \
+              >> analysis/report/macho.txt
 
-            echo >> analysis/info/macho.txt
-            echo "LLVM OBJECT INFO:" >> analysis/info/macho.txt
+            echo "FILE: $file" \
+              >> analysis/report/macho.txt
+
+            echo "============================================" \
+              >> analysis/report/macho.txt
+
+            echo >> analysis/report/macho.txt
+
+            echo "FILE TYPE:" \
+              >> analysis/report/macho.txt
+
+            file "$file" \
+              >> analysis/report/macho.txt 2>&1 || true
+
+            echo >> analysis/report/macho.txt
+
+            echo "ARCHITECTURE / HEADERS:" \
+              >> analysis/report/macho.txt
+
             llvm-objdump --macho --private-headers "$file" \
-              >> analysis/info/macho.txt 2>&1 || true
+              >> analysis/report/macho.txt 2>&1 || true
 
-            echo >> analysis/info/macho.txt
-            echo "DEPENDENCIES:" >> analysis/info/macho.txt
+            echo >> analysis/report/macho.txt
+
+            echo "LOADED DYLIBS:" \
+              >> analysis/report/macho.txt
+
             llvm-objdump --macho --dylibs-used "$file" \
-              >> analysis/info/macho.txt 2>&1 || true
+              >> analysis/report/macho.txt 2>&1 || true
 
-            echo >> analysis/info/macho.txt
-            echo "STRINGS:" >> analysis/info/macho.txt
-            strings "$file" | head -n 5000 \
-              >> analysis/info/macho.txt 2>&1 || true
+            echo >> analysis/report/macho.txt
+
+            echo "STRINGS:" \
+              >> analysis/report/macho.txt
+
+            strings "$file" |
+              head -n 10000 \
+              >> analysis/report/macho.txt 2>&1 || true
+
+            echo >> analysis/report/macho.txt
 
           done < analysis/macho/files.txt
 
-      - name: Prepare Ghidra project
+      - name: Prepare Ghidra
         run: |
           mkdir -p analysis/ghidra_project
           mkdir -p analysis/ghidra_output
 
+      - name: Import Mach-O files into Ghidra
+        run: |
           while IFS= read -r file; do
-            base="$(basename "$file")"
 
-            "$PWD/ghidra/support/analyzeHeadless" \
+            NAME=$(basename "$file")
+
+            echo "============================================"
+            echo "Analyzing: $file"
+            echo "============================================"
+
+            ./ghidra/support/analyzeHeadless \
               "$PWD/analysis/ghidra_project" \
-              "$base" \
+              "$NAME" \
               -import "$PWD/$file" \
-              -analysisTimeoutPerFile 300 \
               -overwrite \
+              -analysisTimeoutPerFile 600 \
               2>&1 | tee -a analysis/ghidra_output/ghidra.log || true
 
           done < analysis/macho/files.txt
 
-      - name: Export useful information
+      - name: Save basic report
         run: |
-          mkdir -p analysis/report
+          echo "IPA ANALYSIS" \
+            > analysis/report/README.txt
 
-          cp analysis/macho/files.txt analysis/report/ 2>/dev/null || true
-          cp analysis/info/macho.txt analysis/report/ 2>/dev/null || true
-          cp analysis/ghidra_output/ghidra.log analysis/report/ 2>/dev/null || true
+          echo >> analysis/report/README.txt
 
-          echo "Analysis completed." > analysis/report/README.txt
-          echo "The Ghidra project contains the imported Mach-O binaries." >> analysis/report/README.txt
-          echo "The report contains architecture, Mach-O headers, dependencies and strings." >> analysis/report/README.txt
+          echo "Found Mach-O files:" \
+            >> analysis/report/README.txt
 
-      - name: Pack results
+          cat analysis/macho/files.txt \
+            >> analysis/report/README.txt 2>/dev/null || true
+
+          echo >> analysis/report/README.txt
+
+          echo "The Ghidra project is located in ghidra_project/." \
+            >> analysis/report/README.txt
+
+      - name: Create archive
         run: |
           cd analysis
-          zip -qr ../ipa-analysis.zip report ghidra_project
+
+          zip -qr ../ipa-analysis.zip \
+            report \
+            macho \
+            ghidra_project \
+            ghidra_output
 
       - name: Upload analysis
         uses: actions/upload-artifact@v4
